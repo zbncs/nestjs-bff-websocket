@@ -1,0 +1,17 @@
+{
+  "name": "nest-websocket-bff",
+  "version": "0.1.0",
+  "private": true,
+  "description": "语音实时转写 Monorepo：web-h5 + NestJS BFF + ASR Mock",
+  "workspaces": [
+    "web-h5",
+    "bff-server",
+    "asr-mock-server"
+  ],
+  "scripts": {
+    "dev:h5": "npm run dev --workspace web-h5",
+    "dev:bff": "npm run dev --workspace bff-server",
+    "dev:mock": "npm run dev --workspace asr-mock-server",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}

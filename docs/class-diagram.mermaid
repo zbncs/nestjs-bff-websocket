@@ -1,0 +1,128 @@
+classDiagram
+    %% ========== 协议层（前后端共享语义） ==========
+    class AsrClientEvent {
+        <<enumeration>>
+        asr:start
+        asr:audio
+        asr:stop
+    }
+    class AsrServerEvent {
+        <<enumeration>>
+        asr:started
+        asr:partial
+        asr:final
+        asr:error
+        asr:stopped
+    }
+    class AsrStartPayload { +sessionId: string; +mimeType?: string }
+    class AsrAudioPayload { +sessionId: string; +seq: number; +chunk: string; +timestamp: number }
+    class AsrStopPayload { +sessionId: string }
+    class AsrStartedPayload { +sessionId: string }
+    class AsrPartialPayload { +sessionId: string; +seq: number; +text: string }
+    class AsrFinalPayload { +sessionId: string; +text: string }
+    class AsrErrorPayload { +sessionId?: string; +code: AsrErrorCode; +message: string }
+    class AsrErrorCode {
+        <<enumeration>>
+        MIC_DENIED / MIC_NOT_FOUND
+        WS_CONNECT_FAILED / WS_DISCONNECTED
+        BACKEND_UNAVAILABLE / BACKEND_TIMEOUT
+        SESSION_NOT_FOUND / START_TIMEOUT / INVALID_STATE
+    }
+
+    %% ========== 前端 ==========
+    class AsrUiState {
+        <<enumeration>>
+        idle
+        connecting
+        recording
+        stopping
+        error
+    }
+    class AsrStore {
+        +state: AsrUiState
+        +sessionId: string|null
+        +partialText: string
+        +finals: string[]
+        +error: AsrErrorPayload|null
+        +start(): Promise~void~
+        +stop(): Promise~void~
+        +onStarted(p): void
+        +onPartial(p): void
+        +onFinal(p): void
+        +onError(p): void
+        +onDisconnected(): void
+    }
+    class SocketService {
+        -socket: Socket
+        +connect(url: string): Promise~void~  // 5s 超时 → WS_CONNECT_FAILED
+        +emitStart(p): void
+        +emitAudio(p): void
+        +emitStop(p): void
+        +on(event, handler): void
+        +disconnect(): void
+    }
+    class AudioRecorderService {
+        -recorder: MediaRecorder
+        -seq: number
+        +start(onChunk: (base64: string, seq: number) => void): Promise~string~  // 返回 mimeType；250ms timeslice
+        +stop(): void
+    }
+
+    %% ========== BFF ==========
+    class AsrGateway {
+        +handleConnection(client: Socket): void
+        +handleDisconnect(client: Socket): void
+        +onStart(client, p: AsrStartPayload): Promise~void~
+        +onAudio(client, p: AsrAudioPayload): void
+        +onStop(client, p: AsrStopPayload): void
+        -notifyBackendDown(sessionId): void
+    }
+    class SessionManager {
+        -sessions: Map~string, BackendSession~
+        +create(sessionId, clientSocketId): BackendSession
+        +get(sessionId): BackendSession|undefined
+        +remove(sessionId): void
+        +findByClient(clientSocketId): BackendSession[]
+    }
+    class BackendSession {
+        +sessionId: string
+        +clientSocketId: string
+        +backendSocket: Socket  // socket.io-client → asr-mock
+        +createdAt: number
+    }
+    class AsrBackendService {
+        -sessionManager: SessionManager
+        +openSession(sessionId, clientSocketId, emitToClient): Promise~void~  // 10s 超时 → BACKEND_TIMEOUT
+        +forwardAudio(sessionId, p): void
+        +closeSession(sessionId): void
+        +closeByClient(clientSocketId): void
+    }
+
+    %% ========== Mock 后端 ==========
+    class MockAsrServer {
+        +PHRASES: string[]  // 10 句中文
+        +handleConnection(socket): void
+    }
+    class MockSession {
+        +chunkCount: number
+        +phraseIndex: number
+        +finalText: string
+        +onAudio(p): void   // 每 3 片 → asr:partial（按序取句增量）
+        +onStop(p): void    // → asr:final 汇总 + asr:stopped
+    }
+
+    %% ========== 关系 ==========
+    AsrStore --> SocketService : 调用
+    AsrStore --> AudioRecorderService : 调用
+    AudioRecorderService ..> AsrAudioPayload : 产出(Base64)
+    SocketService ..> AsrClientEvent : emit
+    AsrGateway --> AsrBackendService : 委托
+    AsrBackendService --> SessionManager : 路由
+    SessionManager "1" o-- "*" BackendSession
+    AsrBackendService ..> AsrServerEvent : 转发回前端
+    MockAsrServer "1" *-- "*" MockSession
+    MockSession ..> AsrPartialPayload : 每3分片
+    MockSession ..> AsrFinalPayload : stop时
+    AsrErrorPayload --> AsrErrorCode
+    AsrStore --> AsrUiState
+
