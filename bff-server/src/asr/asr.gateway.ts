@@ -1,127 +1,153 @@
-import { Logger } from '@nestjs/common';
+import type { IncomingMessage } from 'node:http';
+import type { Duplex } from 'node:stream';
 import {
-  ConnectedSocket,
-  MessageBody,
-  OnGatewayConnection,
-  OnGatewayDisconnect,
-  SubscribeMessage,
-  WebSocketGateway,
-} from '@nestjs/websockets';
-import type { Socket } from 'socket.io';
+  Injectable,
+  Logger,
+  type OnApplicationBootstrap,
+  type OnApplicationShutdown,
+} from '@nestjs/common';
+import { HttpAdapterHost } from '@nestjs/core';
+import WebSocket, { type RawData, WebSocketServer } from 'ws';
+import { WEBSOCKET_IDLE_TIMEOUT_MS } from '../config';
 import {
-  AsrAudioPayload,
-  AsrClientEvent,
+  ASR_STREAM_PATH,
   AsrErrorCode,
-  AsrErrorPayload,
-  AsrServerEvent,
-  AsrStartPayload,
-  AsrStopPayload,
-  EmitToClient,
+  DEFAULT_LANGUAGE,
+  DEFAULT_SAMPLE_RATE,
+  type AsrConnectionOptions,
+  createResponse,
+  parseControlMessage,
 } from '../protocol/events';
 import { AsrBackendService } from './asr-backend.service';
-import { SessionManager } from './session.manager';
+import { type ClientConnection, SessionManager } from './session.manager';
 
-/**
- * 前端侧 WebSocket Gateway（与 BFF HTTP 同端口 3000）。
- * 职责：协议适配与会话入口校验，业务全部委托给 AsrBackendService。
- */
-@WebSocketGateway({ cors: { origin: '*' } })
-export class AsrGateway implements OnGatewayConnection, OnGatewayDisconnect {
+@Injectable()
+export class AsrGateway implements OnApplicationBootstrap, OnApplicationShutdown {
   private readonly logger = new Logger(AsrGateway.name);
+  private readonly server = new WebSocketServer({ noServer: true });
+  private httpServer: ReturnType<HttpAdapterHost['httpAdapter']['getHttpServer']> | null = null;
 
   constructor(
+    private readonly httpAdapterHost: HttpAdapterHost,
     private readonly backendService: AsrBackendService,
     private readonly sessionManager: SessionManager,
   ) {}
 
-  handleConnection(client: Socket): void {
-    this.logger.log(`client connected: ${client.id}`);
+  onApplicationBootstrap(): void {
+    this.httpServer = this.httpAdapterHost.httpAdapter.getHttpServer();
+    this.httpServer.on('upgrade', this.handleUpgrade);
+    this.server.on('connection', this.handleConnection);
   }
 
-  /** 前端断连：级联关闭其全部后端会话 */
-  handleDisconnect(client: Socket): void {
-    this.logger.log(`client disconnected: ${client.id}`);
-    this.backendService.closeByClient(client.id);
+  onApplicationShutdown(): void {
+    this.httpServer?.off('upgrade', this.handleUpgrade);
+    for (const connection of this.sessionManager.all()) {
+      this.closeConnection(connection);
+    }
+    this.server.close();
   }
 
-  @SubscribeMessage(AsrClientEvent.Start)
-  async onStart(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() payload: AsrStartPayload,
-  ): Promise<void> {
-    if (!payload || typeof payload.sessionId !== 'string' || payload.sessionId.length === 0) {
-      const errorPayload: AsrErrorPayload = {
-        code: AsrErrorCode.InvalidState,
-        message: 'asr:start requires a non-empty sessionId',
-      };
-      client.emit(AsrServerEvent.Error, errorPayload);
+  private readonly handleUpgrade = (request: IncomingMessage, socket: Duplex, head: Buffer): void => {
+    const url = new URL(request.url ?? '/', 'http://localhost');
+    if (url.pathname !== ASR_STREAM_PATH) {
+      socket.destroy();
       return;
     }
-    if (this.sessionManager.get(payload.sessionId)) {
-      const errorPayload: AsrErrorPayload = {
-        sessionId: payload.sessionId,
-        code: AsrErrorCode.InvalidState,
-        message: `session ${payload.sessionId} already exists`,
-      };
-      client.emit(AsrServerEvent.Error, errorPayload);
+    this.server.handleUpgrade(request, socket, head, (webSocket) => {
+      this.server.emit('connection', webSocket, request);
+    });
+  };
+
+  private readonly handleConnection = (clientSocket: WebSocket, request: IncomingMessage): void => {
+    const requestUrl = new URL(request.url ?? ASR_STREAM_PATH, 'http://localhost');
+    const options = this.parseOptions(requestUrl.searchParams);
+    if (!options) {
+      clientSocket.send(JSON.stringify(createResponse(AsrErrorCode.InvalidQuery, 'Invalid connection query parameters')));
+      clientSocket.close(1008, 'invalid query parameters');
       return;
     }
 
-    const emitToClient: EmitToClient = (event, data) => {
-      client.emit(event, data);
-    };
+    const connection = this.sessionManager.create(clientSocket, options);
+    this.refreshIdleTimer(connection);
+    this.logger.log(`browser connected: ${connection.id}`);
 
-    try {
-      await this.backendService.openSession(
-        payload.sessionId,
-        client.id,
-        emitToClient,
-        payload.mimeType,
-      );
-    } catch (err) {
-      // 10s 内连不上后端：回 BACKEND_TIMEOUT 并确保无残留
-      const errorPayload: AsrErrorPayload = {
-        sessionId: payload.sessionId,
-        code: AsrErrorCode.BackendTimeout,
-        message: `connect ASR backend failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
-      client.emit(AsrServerEvent.Error, errorPayload);
-      this.backendService.closeSession(payload.sessionId);
-    }
-  }
+    clientSocket.on('message', (data: RawData, isBinary: boolean) => {
+      this.refreshIdleTimer(connection);
+      this.handleMessage(connection, rawDataToBuffer(data), isBinary);
+    });
+    clientSocket.on('close', () => this.closeConnection(connection));
+    clientSocket.on('error', (error: Error) => {
+      this.logger.warn(`browser connection error ${connection.id}: ${error.message}`);
+    });
+  };
 
-  @SubscribeMessage(AsrClientEvent.Audio)
-  onAudio(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() payload: AsrAudioPayload,
-  ): void {
-    if (!this.sessionManager.get(payload.sessionId)) {
-      const errorPayload: AsrErrorPayload = {
-        sessionId: payload.sessionId,
-        code: AsrErrorCode.SessionNotFound,
-        message: `session ${payload.sessionId} not found`,
-      };
-      client.emit(AsrServerEvent.Error, errorPayload);
+  private handleMessage(connection: ClientConnection, data: Buffer, isBinary: boolean): void {
+    if (isBinary) {
+      if (connection.recognitionState === 'stopping') {
+        this.sendError(connection, AsrErrorCode.InvalidState, 'The current recognition session is stopping');
+        return;
+      }
+      connection.recognitionState = 'recognizing';
+      this.backendService.forward(connection, data, true);
       return;
     }
-    this.backendService.forwardAudio(payload.sessionId, payload);
-  }
 
-  @SubscribeMessage(AsrClientEvent.Stop)
-  onStop(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() payload: AsrStopPayload,
-  ): void {
-    if (!this.sessionManager.get(payload.sessionId)) {
-      const errorPayload: AsrErrorPayload = {
-        sessionId: payload.sessionId,
-        code: AsrErrorCode.SessionNotFound,
-        message: `session ${payload.sessionId} not found`,
-      };
-      client.emit(AsrServerEvent.Error, errorPayload);
+    const control = parseControlMessage(data.toString('utf8'));
+    if (!control) {
+      this.sendError(connection, AsrErrorCode.InvalidMessage, 'Only the {"action":"stop"} control message is supported');
       return;
     }
-    // 透传 stop；后端回 asr:stopped 后由 AsrBackendService 负责销毁会话
-    this.backendService.forwardStop(payload.sessionId, payload);
+    if (connection.recognitionState !== 'recognizing') {
+      this.sendError(connection, AsrErrorCode.InvalidState, 'No active recognition session');
+      return;
+    }
+    connection.recognitionState = 'stopping';
+    this.backendService.forward(connection, Buffer.from(JSON.stringify(control)), false);
   }
+
+  private parseOptions(params: URLSearchParams): AsrConnectionOptions | null {
+    const sampleRateValue = params.get('sampleRate');
+    const sampleRate = sampleRateValue === null ? DEFAULT_SAMPLE_RATE : Number(sampleRateValue);
+    const language = params.get('language') ?? DEFAULT_LANGUAGE;
+    if ((sampleRate !== 8_000 && sampleRate !== 16_000) || language.trim().length === 0) {
+      return null;
+    }
+    return { sampleRate, language };
+  }
+
+  private refreshIdleTimer(connection: ClientConnection): void {
+    if (connection.idleTimer) {
+      clearTimeout(connection.idleTimer);
+    }
+    connection.idleTimer = setTimeout(() => {
+      if (connection.clientSocket.readyState === WebSocket.OPEN) {
+        connection.clientSocket.close(1000, 'idle timeout');
+      }
+    }, WEBSOCKET_IDLE_TIMEOUT_MS);
+  }
+
+  private sendError(connection: ClientConnection, code: number, message: string): void {
+    if (connection.clientSocket.readyState === WebSocket.OPEN) {
+      connection.clientSocket.send(JSON.stringify(createResponse(code, message)));
+    }
+  }
+
+  private closeConnection(connection: ClientConnection): void {
+    if (!this.sessionManager.has(connection)) {
+      return;
+    }
+    if (connection.idleTimer) {
+      clearTimeout(connection.idleTimer);
+    }
+    this.sessionManager.remove(connection.clientSocket);
+    this.backendService.close(connection);
+    this.logger.log(`browser disconnected: ${connection.id}`);
+  }
+}
+
+function rawDataToBuffer(data: RawData): Buffer {
+  if (Array.isArray(data)) {
+    return Buffer.concat(data);
+  }
+  return Buffer.isBuffer(data) ? data : Buffer.from(data);
 }

@@ -2,3 +2,8 @@ packages:
   - web-h5
   - bff-server
   - asr-mock-server
+
+allowBuilds:
+  esbuild: true
+
+minimumReleaseAge: 10

@@ -1,78 +1,73 @@
-import { AsrErrorCode, AsrErrorPayload } from '../types/protocol';
+import { ClientErrorCode, type AsrError } from '../types/protocol';
 
-/** MediaRecorder 分片间隔（共享约定第 8 条） */
-export const AUDIO_TIMESLICE_MS = 250;
+export const AUDIO_CHUNK_BYTES = 3_200;
 
-/** 优先使用的音频编码（Chromium 系支持最好） */
-const PREFERRED_MIME_TYPE = 'audio/webm;codecs=opus';
-
-/**
- * MediaRecorder 分片采集：Blob → ArrayBuffer → Base64。
- * 权限拒绝抛 MIC_DENIED，无设备抛 MIC_NOT_FOUND（均为 AsrErrorPayload 结构）。
- */
+/** Captures mono audio and emits raw PCM 16-bit little-endian chunks. */
 export class AudioRecorderService {
-  private recorder: MediaRecorder | null = null;
   private stream: MediaStream | null = null;
-  private seq = 0;
+  private audioContext: AudioContext | null = null;
+  private source: MediaStreamAudioSourceNode | null = null;
+  private processor: ScriptProcessorNode | null = null;
+  private silentGain: GainNode | null = null;
 
-  /**
-   * 申请麦克风并开始分片采集。
-   * @param onChunk 每 250ms 回调一次（base64, seq），seq 从 1 自增
-   * @returns 实际使用的 mimeType（随 asr:start 透传给后端）
-   * @throws AsrErrorPayload（MIC_DENIED / MIC_NOT_FOUND）
-   */
-  async start(onChunk: (base64: string, seq: number) => void): Promise<string> {
+  async start(sampleRate: number, onChunk: (chunk: ArrayBuffer) => void): Promise<void> {
+    this.stop();
     if (!navigator.mediaDevices?.getUserMedia) {
-      const error: AsrErrorPayload = {
-        code: AsrErrorCode.MicNotFound,
-        message: '当前浏览器不支持麦克风采集',
-      };
-      throw error;
+      throw this.error(ClientErrorCode.MicNotFound, '当前浏览器不支持麦克风采集');
     }
 
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, sampleRate, echoCancellation: false, noiseSuppression: false },
+      });
     } catch (err) {
       const name = err instanceof DOMException ? err.name : '';
-      const error: AsrErrorPayload =
-        name === 'NotFoundError' || name === 'OverconstrainedError'
-          ? { code: AsrErrorCode.MicNotFound, message: '未检测到可用的麦克风设备' }
-          : { code: AsrErrorCode.MicDenied, message: '麦克风权限被拒绝，请在浏览器设置中授权' };
-      throw error;
-    }
-    this.stream = stream;
-
-    const recorder = MediaRecorder.isTypeSupported(PREFERRED_MIME_TYPE)
-      ? new MediaRecorder(stream, { mimeType: PREFERRED_MIME_TYPE })
-      : new MediaRecorder(stream);
-    this.recorder = recorder;
-    this.seq = 0;
-
-    recorder.ondataavailable = (event: BlobEvent) => {
-      if (event.data.size === 0) {
-        return;
+      if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+        throw this.error(ClientErrorCode.MicNotFound, '未检测到可用的麦克风设备');
       }
-      this.seq += 1;
-      const seq = this.seq;
-      void event.data
-        .arrayBuffer()
-        .then((buffer) => onChunk(arrayBufferToBase64(buffer), seq))
-        .catch((err: unknown) => {
-          console.error('[audioRecorder] chunk encode failed:', err);
-        });
-    };
+      throw this.error(ClientErrorCode.MicDenied, '麦克风权限被拒绝，请在浏览器设置中授权');
+    }
 
-    recorder.start(AUDIO_TIMESLICE_MS);
-    return recorder.mimeType;
+    const context = new AudioContext({ sampleRate });
+    const source = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(2_048, 1, 1);
+    const silentGain = context.createGain();
+    silentGain.gain.value = 0;
+    const encoder = new PcmChunkEncoder(context.sampleRate, sampleRate, AUDIO_CHUNK_BYTES / 2);
+
+    processor.onaudioprocess = (event: AudioProcessingEvent) => {
+      const input = event.inputBuffer.getChannelData(0);
+      for (const chunk of encoder.push(input)) {
+        onChunk(chunk);
+      }
+    };
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(context.destination);
+
+    this.stream = stream;
+    this.audioContext = context;
+    this.source = source;
+    this.processor = processor;
+    this.silentGain = silentGain;
+    await context.resume();
   }
 
-  /** 停止采集并释放麦克风 */
   stop(): void {
-    if (this.recorder && this.recorder.state !== 'inactive') {
-      this.recorder.stop();
+    if (this.processor) {
+      this.processor.onaudioprocess = null;
+      this.processor.disconnect();
+      this.processor = null;
     }
-    this.recorder = null;
+    this.source?.disconnect();
+    this.source = null;
+    this.silentGain?.disconnect();
+    this.silentGain = null;
+    if (this.audioContext) {
+      void this.audioContext.close();
+      this.audioContext = null;
+    }
     if (this.stream) {
       for (const track of this.stream.getTracks()) {
         track.stop();
@@ -80,15 +75,60 @@ export class AudioRecorderService {
       this.stream = null;
     }
   }
+
+  private error(code: number, message: string): AsrError {
+    return { code, message };
+  }
 }
 
-/** ArrayBuffer → Base64（分块转换，避免大 buffer 展开参数栈溢出） */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const CHUNK_SIZE = 0x8000;
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK_SIZE));
+class PcmChunkEncoder {
+  private readonly inputSamples: number[] = [];
+  private readonly pcmSamples: number[] = [];
+  private inputPosition = 0;
+
+  constructor(
+    private readonly inputSampleRate: number,
+    private readonly outputSampleRate: number,
+    private readonly chunkSamples: number,
+  ) {}
+
+  push(input: Float32Array): ArrayBuffer[] {
+    for (const sample of input) {
+      this.inputSamples.push(sample);
+    }
+
+    const ratio = this.inputSampleRate / this.outputSampleRate;
+    while (this.inputPosition + ratio <= this.inputSamples.length) {
+      const start = Math.floor(this.inputPosition);
+      const end = Math.max(start + 1, Math.floor(this.inputPosition + ratio));
+      let total = 0;
+      let count = 0;
+      for (let index = start; index < end && index < this.inputSamples.length; index += 1) {
+        total += this.inputSamples[index];
+        count += 1;
+      }
+      this.pcmSamples.push(total / count);
+      this.inputPosition += ratio;
+    }
+
+    const consumed = Math.floor(this.inputPosition);
+    if (consumed > 0) {
+      this.inputSamples.splice(0, consumed);
+      this.inputPosition -= consumed;
+    }
+
+    const chunks: ArrayBuffer[] = [];
+    while (this.pcmSamples.length >= this.chunkSamples) {
+      const samples = this.pcmSamples.splice(0, this.chunkSamples);
+      const buffer = new ArrayBuffer(this.chunkSamples * 2);
+      const view = new DataView(buffer);
+      samples.forEach((sample, index) => {
+        const clamped = Math.max(-1, Math.min(1, sample));
+        const value = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+        view.setInt16(index * 2, Math.round(value), true);
+      });
+      chunks.push(buffer);
+    }
+    return chunks;
   }
-  return btoa(binary);
 }

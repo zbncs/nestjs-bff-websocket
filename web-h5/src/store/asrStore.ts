@@ -2,191 +2,143 @@ import { create } from 'zustand';
 import { AudioRecorderService } from '../services/audioRecorder';
 import { SocketService } from '../services/socket';
 import {
-  AsrErrorCode,
-  AsrErrorPayload,
-  AsrFinalPayload,
-  AsrPartialPayload,
-  AsrServerEvent,
-  AsrStartedPayload,
-  AsrStoppedPayload,
+  ASR_STREAM_PATH,
+  ClientErrorCode,
+  DEFAULT_LANGUAGE,
+  DEFAULT_SAMPLE_RATE,
+  type AsrError,
+  type AsrResponse,
 } from '../types/protocol';
 
-/** 前端 connecting 看门狗超时（共享约定第 5 条） */
-export const START_TIMEOUT_MS = 5000;
-
-/** BFF 地址（socket.io 直连，无需 vite proxy） */
-export const BFF_URL = 'http://localhost:3000';
-
-/** 前端状态机：idle → connecting → recording → stopping → idle/error */
+export const BFF_ORIGIN = 'ws://localhost:3000';
 export type AsrUiState = 'idle' | 'connecting' | 'recording' | 'stopping' | 'error';
 
 export interface AsrStore {
   state: AsrUiState;
-  sessionId: string | null;
   partialText: string;
   finals: string[];
-  error: AsrErrorPayload | null;
-
+  error: AsrError | null;
   start: () => Promise<void>;
-  stop: () => Promise<void>;
-  onStarted: (payload: AsrStartedPayload) => void;
-  onPartial: (payload: AsrPartialPayload) => void;
-  onFinal: (payload: AsrFinalPayload) => void;
-  onStopped: (payload: AsrStoppedPayload) => void;
-  onError: (payload: AsrErrorPayload) => void;
+  stop: () => void;
+  onResponse: (response: AsrResponse) => void;
   onDisconnected: () => void;
 }
 
-// 模块级单例：一次会话一条 socket 连接、一个录音器实例
 const socketService = new SocketService();
 const audioRecorder = new AudioRecorderService();
 
-let startWatchdog: ReturnType<typeof setTimeout> | null = null;
-
-function clearWatchdog(): void {
-  if (startWatchdog !== null) {
-    clearTimeout(startWatchdog);
-    startWatchdog = null;
-  }
+function isAsrError(error: unknown): error is AsrError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'number' &&
+    'message' in error &&
+    typeof error.message === 'string'
+  );
 }
 
-function isAsrErrorPayload(err: unknown): err is AsrErrorPayload {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    'code' in err &&
-    typeof (err as { code: unknown }).code === 'string'
-  );
+function getWebSocketUrl(): string {
+  const query = new URLSearchParams({
+    sampleRate: String(DEFAULT_SAMPLE_RATE),
+    language: DEFAULT_LANGUAGE,
+  });
+  return `${BFF_ORIGIN}${ASR_STREAM_PATH}?${query.toString()}`;
 }
 
 export const useAsrStore = create<AsrStore>((set, get) => ({
   state: 'idle',
-  sessionId: null,
   partialText: '',
   finals: [],
   error: null,
 
   start: async () => {
-    const current = get().state;
-    if (current === 'connecting' || current === 'recording' || current === 'stopping') {
+    const state = get().state;
+    if (state === 'connecting' || state === 'recording' || state === 'stopping') {
       return;
     }
-
-    const sessionId = crypto.randomUUID();
-    set({ state: 'connecting', sessionId, error: null, partialText: '' });
-
-    // 5s 看门狗：未收到 asr:started 则 START_TIMEOUT
-    startWatchdog = setTimeout(() => {
-      get().onError({
-        sessionId,
-        code: AsrErrorCode.StartTimeout,
-        message: `${START_TIMEOUT_MS}ms 内未收到 asr:started`,
-      });
-    }, START_TIMEOUT_MS);
+    set({ state: 'connecting', error: null, partialText: '' });
 
     try {
-      // ① 先申请麦克风并启动分片采集（started 前产生的分片不上送）
-      const mimeType = await audioRecorder.start((base64, seq) => {
-        const s = get();
-        if (s.state === 'recording' && s.sessionId) {
-          socketService.emitAudio({
-            sessionId: s.sessionId,
-            seq,
-            chunk: base64,
-            timestamp: Date.now(),
+      await socketService.connect(getWebSocketUrl(), {
+        onResponse: (response) => get().onResponse(response),
+        onDisconnected: () => get().onDisconnected(),
+        onProtocolError: (message) => {
+          audioRecorder.stop();
+          socketService.disconnect();
+          set({
+            state: 'error',
+            error: { code: ClientErrorCode.InvalidServerResponse, message },
+            partialText: '',
           });
+        },
+      });
+      await audioRecorder.start(DEFAULT_SAMPLE_RATE, (chunk) => {
+        if (get().state === 'recording') {
+          socketService.sendAudio(chunk);
         }
       });
-
-      // ② 连接 BFF（5s 超时）并接线服务端事件
-      await socketService.connect(BFF_URL);
-      socketService.on<AsrStartedPayload>(AsrServerEvent.Started, (p) => get().onStarted(p));
-      socketService.on<AsrPartialPayload>(AsrServerEvent.Partial, (p) => get().onPartial(p));
-      socketService.on<AsrFinalPayload>(AsrServerEvent.Final, (p) => get().onFinal(p));
-      socketService.on<AsrStoppedPayload>(AsrServerEvent.Stopped, (p) => get().onStopped(p));
-      socketService.on<AsrErrorPayload>(AsrServerEvent.Error, (p) => get().onError(p));
-      socketService.on<string>('disconnect', () => get().onDisconnected());
-
-      // ③ 发起会话
-      socketService.emitStart({ sessionId, mimeType });
-    } catch (err) {
-      if (isAsrErrorPayload(err)) {
-        get().onError({ ...err, sessionId });
-      } else {
-        get().onError({
-          sessionId,
-          code: AsrErrorCode.WsConnectFailed,
-          message: `连接 BFF 失败：${err instanceof Error ? err.message : String(err)}`,
-        });
+      if (get().state !== 'connecting' || !socketService.isConnected()) {
+        audioRecorder.stop();
+        return;
       }
+      set({ state: 'recording' });
+    } catch (error) {
+      audioRecorder.stop();
+      set({
+        state: 'error',
+        error: isAsrError(error)
+          ? error
+          : { code: ClientErrorCode.WebSocketConnectFailed, message: '连接语音识别服务失败' },
+      });
     }
   },
 
-  stop: async () => {
-    const { state, sessionId } = get();
-    if (state !== 'recording' || !sessionId) {
+  stop: () => {
+    if (get().state !== 'recording') {
       return;
     }
     set({ state: 'stopping' });
     audioRecorder.stop();
-    socketService.emitStop({ sessionId });
-    // 回到 idle 由 onStopped / onError / onDisconnected 驱动
+    socketService.sendStop();
   },
 
-  onStarted: (payload) => {
-    const { state, sessionId } = get();
-    if (state !== 'connecting' || payload.sessionId !== sessionId) {
+  onResponse: (response) => {
+    if (response.code !== 0) {
+      audioRecorder.stop();
+      socketService.disconnect();
+      set({
+        state: 'error',
+        error: { code: response.code, message: response.msg },
+        partialText: '',
+      });
       return;
     }
-    clearWatchdog();
-    set({ state: 'recording' });
-  },
-
-  onPartial: (payload) => {
-    const { state, sessionId } = get();
-    if ((state === 'recording' || state === 'stopping') && payload.sessionId === sessionId) {
-      set({ partialText: payload.text });
-    }
-  },
-
-  onFinal: (payload) => {
-    const { sessionId, finals } = get();
-    if (payload.sessionId !== sessionId) {
+    if (response.data.isFinal) {
+      const finals = response.data.text ? [...get().finals, response.data.text] : get().finals;
+      set({ state: 'idle', finals, partialText: '', error: null });
       return;
     }
-    set({ finals: [...finals, payload.text], partialText: '' });
-  },
-
-  onStopped: (payload) => {
-    const { sessionId } = get();
-    if (payload.sessionId && payload.sessionId !== sessionId) {
-      return;
+    if (get().state === 'recording' || get().state === 'stopping') {
+      set({ partialText: response.data.text });
     }
-    clearWatchdog();
-    set({ state: 'idle', sessionId: null, partialText: '' });
-    socketService.disconnect();
-  },
-
-  onError: (payload) => {
-    clearWatchdog();
-    audioRecorder.stop();
-    const { sessionId } = get();
-    // 尽力通知后端清理（START_TIMEOUT 场景），随后断开连接
-    if (sessionId && socketService.isConnected()) {
-      socketService.emitStop({ sessionId });
-    }
-    set({ state: 'error', error: payload, partialText: '' });
-    socketService.disconnect();
   },
 
   onDisconnected: () => {
-    const { state, sessionId } = get();
-    if (state === 'connecting' || state === 'recording' || state === 'stopping') {
-      get().onError({
-        sessionId: sessionId ?? undefined,
-        code: AsrErrorCode.WsDisconnected,
-        message: '与 BFF 的连接已断开',
-      });
+    const state = get().state;
+    if (state === 'idle') {
+      return;
     }
+    audioRecorder.stop();
+    set({
+      state: 'error',
+      error: { code: ClientErrorCode.WebSocketDisconnected, message: '与语音识别服务的连接已断开' },
+      partialText: '',
+    });
   },
 }));
+
+window.addEventListener('beforeunload', () => {
+  audioRecorder.stop();
+  socketService.disconnect();
+});

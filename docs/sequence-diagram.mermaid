@@ -1,61 +1,18 @@
 sequenceDiagram
-    autonumber
-    participant U as 用户
-    participant FE as web-h5 (AsrStore/Socket/Recorder)
-    participant BFF as bff-server (AsrGateway/BackendService)
-    participant ASR as asr-mock-server
+    participant Browser
+    participant BFF
+    participant ASR as ASR Mock / Real ASR
 
-    Note over FE,ASR: ① 启动：asr:start 全链路（含两级超时）
-    U->>FE: 点击录音
-    FE->>FE: state: idle→connecting；启动 5s 看门狗
-    FE->>FE: AudioRecorder.start() 请求麦克风
-    alt 麦克风拒绝/无设备
-        FE-->>U: asr:error MIC_DENIED / MIC_NOT_FOUND（本地生成，state→error）
-    end
-    FE->>BFF: socket.connect() + emit asr:start {sessionId, mimeType}
-    BFF->>BFF: SessionManager.create(sessionId)
-    BFF->>ASR: new socket.io-client 连接（10s 超时）
-    ASR-->>BFF: connect 成功
-    BFF->>ASR: emit asr:start {sessionId}
-    ASR-->>BFF: asr:started {sessionId}
-    BFF-->>FE: asr:started {sessionId}
-    FE->>FE: 看门狗取消；state→recording；MediaRecorder 启动(250ms)
-    alt 5s 内未收到 asr:started
-        FE-->>U: asr:error START_TIMEOUT；发 asr:stop 清理；state→error
-    end
-    alt BFF 10s 连不上后端
-        BFF-->>FE: asr:error BACKEND_TIMEOUT；销毁 session
-    end
-
-    Note over FE,ASR: ② 录音分片透传 + 实时 partial
-    loop 每 250ms
-        FE->>FE: Blob→ArrayBuffer→Base64，seq++
-        FE->>BFF: asr:audio {sessionId, seq, chunk, timestamp}
-        BFF->>ASR: 透传 asr:audio（sessionId 路由）
-        ASR->>ASR: chunkCount++
-        opt 每累计 3 片
-            ASR-->>BFF: asr:partial {sessionId, seq, text(句子增量)}
-            BFF-->>FE: 透传 asr:partial
-            FE->>FE: 更新 partialText
-        end
-    end
-
-    Note over FE,ASR: ③ 停止：asr:stop → final
-    U->>FE: 停止
-    FE->>FE: state→stopping；Recorder.stop()
-    FE->>BFF: asr:stop {sessionId}
-    BFF->>ASR: 透传 asr:stop
-    ASR-->>BFF: asr:final {sessionId, text汇总} + asr:stopped
-    BFF-->>FE: 透传 asr:final / asr:stopped
-    FE->>FE: final 入列表、清空 partial；state→idle
-    BFF->>ASR: 断开后端连接；SessionManager.remove(sessionId)
-
-    Note over FE,ASR: ④ 异常：后端断连级联通知
-    ASR--xBFF: backend socket disconnect（进程退出/网络断）
-    BFF->>BFF: 遍历 Map 找受影响 session
-    BFF-->>FE: asr:error {code: BACKEND_UNAVAILABLE}
-    FE->>FE: state→error；Recorder.stop()
-    opt 前端断连
-        FE--xBFF: client disconnect
-        BFF->>BFF: closeByClient(clientSocketId)：关后端连接、清 session
-    end
+    Browser->>BFF: Connect /intelligentVoice/asr/stream?sampleRate&language
+    BFF-->>Browser: WebSocket connected
+    Browser->>BFF: Binary PCM chunks
+    BFF->>ASR: Establish or reuse managed connection
+    BFF->>ASR: Binary PCM chunks
+    ASR-->>BFF: {code:0,data:{text,isFinal:false}}
+    BFF-->>Browser: Normalized JSON response
+    Browser->>BFF: {"action":"stop"}
+    BFF->>ASR: {"action":"stop"}
+    ASR-->>BFF: {code:0,data:{text,isFinal:true}}
+    BFF-->>Browser: Final JSON response
+    Note over Browser,BFF: WebSocket remains open
+    Browser->>BFF: Binary PCM chunks for next Session

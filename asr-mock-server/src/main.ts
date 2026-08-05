@@ -1,40 +1,59 @@
-import { Server } from 'socket.io';
-import {
-  AsrClientEvent,
-  AsrAudioPayload,
-  AsrStartPayload,
-  AsrStopPayload,
-  MockSession,
-} from './session';
+import { type RawData, WebSocketServer } from 'ws';
+import { MockSession } from './session';
 
-/** Mock ASR 后端固定端口（共享约定第 7 条） */
 const PORT = 3001;
+const ASR_STREAM_PATH = '/intelligentVoice/asr/stream';
+const IDLE_TIMEOUT_MS = 60_000;
 
-const io = new Server(PORT, {
-  cors: { origin: '*' },
-});
+const server = new WebSocketServer({ port: PORT, path: ASR_STREAM_PATH });
 
-io.on('connection', (socket) => {
-  console.log(`[mock] client connected: ${socket.id}`);
+server.on('connection', (socket, request) => {
+  const url = new URL(request.url ?? ASR_STREAM_PATH, 'http://localhost');
+  const sampleRateValue = url.searchParams.get('sampleRate');
+  const sampleRate = sampleRateValue === null ? 16_000 : Number(sampleRateValue);
+  const language = url.searchParams.get('language') ?? 'zh-CN';
+  if ((sampleRate !== 8_000 && sampleRate !== 16_000) || language.trim().length === 0) {
+    socket.send(JSON.stringify({
+      code: 1001,
+      msg: 'Invalid connection query parameters',
+      data: { text: '', isFinal: false },
+    }));
+    socket.close(1008, 'invalid query parameters');
+    return;
+  }
+
   const session = new MockSession(socket);
+  let idleTimer: ReturnType<typeof setTimeout>;
+  const refreshIdleTimer = (): void => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => socket.close(1000, 'idle timeout'), IDLE_TIMEOUT_MS);
+  };
 
-  socket.on(AsrClientEvent.Start, (payload: AsrStartPayload) => {
-    console.log(`[mock] asr:start session=${payload.sessionId} mime=${payload.mimeType ?? 'n/a'}`);
-    session.onStart(payload);
+  refreshIdleTimer();
+  console.log(`[mock] client connected: ${request.socket.remoteAddress ?? 'unknown'}`);
+
+  socket.on('message', (data, isBinary) => {
+    refreshIdleTimer();
+    if (isBinary) {
+      session.onAudio(rawDataToBuffer(data));
+    } else {
+      session.onControl(data.toString());
+    }
   });
-
-  socket.on(AsrClientEvent.Audio, (payload: AsrAudioPayload) => {
-    session.onAudio(payload);
+  socket.on('close', () => {
+    clearTimeout(idleTimer);
+    console.log('[mock] client disconnected');
   });
-
-  socket.on(AsrClientEvent.Stop, (payload: AsrStopPayload) => {
-    console.log(`[mock] asr:stop session=${payload.sessionId}`);
-    session.onStop(payload);
-  });
-
-  socket.on('disconnect', (reason: string) => {
-    console.log(`[mock] client disconnected: ${socket.id} (${reason})`);
+  socket.on('error', (error: Error) => {
+    console.error(`[mock] WebSocket error: ${error.message}`);
   });
 });
 
-console.log(`[mock] asr-mock-server listening on http://localhost:${PORT}`);
+console.log(`[mock] WebSocket listening on ws://localhost:${PORT}${ASR_STREAM_PATH}`);
+
+function rawDataToBuffer(data: RawData): Buffer {
+  if (Array.isArray(data)) {
+    return Buffer.concat(data);
+  }
+  return Buffer.isBuffer(data) ? data : Buffer.from(data);
+}

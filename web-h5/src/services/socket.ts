@@ -1,77 +1,101 @@
-import { io, Socket } from 'socket.io-client';
 import {
-  AsrAudioPayload,
-  AsrClientEvent,
-  AsrStartPayload,
-  AsrStopPayload,
+  ClientErrorCode,
+  type AsrResponse,
+  parseAsrResponse,
 } from '../types/protocol';
 
-/** 前端 socket 连接超时（共享约定第 5 条） */
-export const SOCKET_CONNECT_TIMEOUT_MS = 5000;
+export const SOCKET_CONNECT_TIMEOUT_MS = 5_000;
 
-/**
- * socket.io-client 封装：连接管理 + 协议事件收发。
- * 每次 connect 新建 socket 实例，保证事件监听不残留、不重复。
- */
+export interface SocketHandlers {
+  onResponse: (response: AsrResponse) => void;
+  onDisconnected: () => void;
+  onProtocolError: (message: string) => void;
+}
+
+/** Browser-facing native WebSocket transport. */
 export class SocketService {
-  private socket: Socket | null = null;
+  private socket: WebSocket | null = null;
+  private handlers: SocketHandlers | null = null;
 
-  /**
-   * 建立连接（5s 超时）。
-   * @throws Error('WS_CONNECT_FAILED') 超时或 connect_error
-   */
-  connect(url: string): Promise<void> {
+  connect(url: string, handlers: SocketHandlers): Promise<void> {
+    this.handlers = handlers;
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      return Promise.resolve();
+    }
     this.disconnect();
+
     return new Promise<void>((resolve, reject) => {
-      const socket = io(url, {
-        reconnection: false,
-        timeout: SOCKET_CONNECT_TIMEOUT_MS,
-      });
+      const socket = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
       this.socket = socket;
+      let settled = false;
 
       const timer = setTimeout(() => {
-        socket.disconnect();
-        reject(new Error('WS_CONNECT_FAILED'));
+        if (!settled) {
+          settled = true;
+          socket.close();
+          reject(new Error(String(ClientErrorCode.WebSocketConnectFailed)));
+        }
       }, SOCKET_CONNECT_TIMEOUT_MS);
 
-      socket.once('connect', () => {
+      socket.onopen = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         clearTimeout(timer);
         resolve();
-      });
-      socket.once('connect_error', (err: Error) => {
+      };
+      socket.onmessage = (event: MessageEvent<unknown>) => {
+        if (typeof event.data !== 'string') {
+          this.handlers?.onProtocolError('服务端返回了非文本响应');
+          return;
+        }
+        const response = parseAsrResponse(event.data);
+        if (!response) {
+          this.handlers?.onProtocolError('服务端返回的 JSON 结构不符合接口文档');
+          return;
+        }
+        this.handlers?.onResponse(response);
+      };
+      socket.onerror = () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error(String(ClientErrorCode.WebSocketConnectFailed)));
+        }
+      };
+      socket.onclose = () => {
         clearTimeout(timer);
-        socket.disconnect();
-        reject(new Error(`WS_CONNECT_FAILED: ${err.message}`));
-      });
+        if (this.socket === socket) {
+          this.socket = null;
+          this.handlers?.onDisconnected();
+        }
+      };
     });
   }
 
-  /** 订阅事件（asr:* 协议事件或 socket.io 内建事件如 disconnect） */
-  on<T>(event: string, handler: (payload: T) => void): void {
-    this.socket?.on(event, handler as (payload: unknown) => void);
+  sendAudio(chunk: ArrayBuffer): void {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(chunk);
+    }
   }
 
-  emitStart(payload: AsrStartPayload): void {
-    this.socket?.emit(AsrClientEvent.Start, payload);
-  }
-
-  emitAudio(payload: AsrAudioPayload): void {
-    this.socket?.emit(AsrClientEvent.Audio, payload);
-  }
-
-  emitStop(payload: AsrStopPayload): void {
-    this.socket?.emit(AsrClientEvent.Stop, payload);
+  sendStop(): void {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ action: 'stop' }));
+    }
   }
 
   isConnected(): boolean {
-    return this.socket?.connected ?? false;
+    return this.socket?.readyState === WebSocket.OPEN;
   }
 
   disconnect(): void {
-    if (this.socket) {
-      this.socket.removeAllListeners();
-      this.socket.disconnect();
-      this.socket = null;
+    const socket = this.socket;
+    this.socket = null;
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      socket.close(1000, 'page closed');
     }
   }
 }

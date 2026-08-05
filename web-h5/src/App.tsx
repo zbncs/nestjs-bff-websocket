@@ -10,7 +10,7 @@ export default function App(): JSX.Element {
     <div className="app">
       <header className="app__header">
         <h1 className="app__title">语音实时转写 Demo</h1>
-        <p className="app__subtitle">web-h5 → BFF(NestJS) → ASR Mock · socket.io 全链路</p>
+        <p className="app__subtitle">web-h5 → BFF(NestJS) → ASR Mock · 原生 WebSocket 全链路</p>
       </header>
       <StatusBar />
       <main className="app__main">

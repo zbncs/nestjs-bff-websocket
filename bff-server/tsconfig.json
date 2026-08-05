@@ -4,6 +4,7 @@
     "target": "ES2021",
     "moduleResolution": "node",
     "lib": ["ES2021"],
+    "ignoreDeprecations": "6.0",
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "strict": true,
