@@ -17,8 +17,8 @@ Browser 永远不感知后端 ASR 的连接策略。浏览器只使用 BFF 公�
 - 一个浏览器页面维护一条到 BFF 的 WebSocket 长连接。
 - 一条连接内同一时间只允许一个识别 Session。
 - 第一段二进制音频把 Session 从 `idle` 切换为 `recognizing`。
-- `stop` 把 Session 切换为 `stopping`。
-- 收到最终结果后回到 `idle`，WebSocket 保持连接，可开始下一次识别。
+- 每句话的 `isFinal=true` 只结束当前句，Session 保持 `recognizing` 并继续接收下一句话。
+- `stop` 把 Session 切换为 `stopping`；收到停止确认对应的最终响应后回到 `idle`。
 - 连接连续 60 秒无数据时关闭；浏览器下次录音时自动重连。
 - BFF 到 ASR 的连接由 BFF 独立创建、复用和清理，不进入浏览器协议。
 
@@ -39,8 +39,9 @@ Browser 永远不感知后端 ASR 的连接策略。浏览器只使用 BFF 公�
 }
 ```
 
-- `isFinal=false`：替换页面当前的中间结果。
-- `isFinal=true`：追加最终结果并结束当前 Session。
+- `isFinal=false`：替换页面当前句的动态结果。
+- `isFinal=true`：用最终内容替换当前动态结果并加入已确认内容，不结束 Session。
+- `stop` 后的最终响应：结束当前 Session；空文本只作为结束确认，不追加显示。
 - `code!=0`：结束当前录音并展示错误；前端断开异常连接，重试时重新建立连接。
 
 公开协议和错误码见 [asr-stream-api.md](asr-stream-api.md)。

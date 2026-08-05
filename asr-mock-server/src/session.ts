@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import { PHRASES } from './phrases';
 
-export const CHUNKS_PER_PARTIAL = 3;
+export const CHUNKS_PER_SENTENCE = 3;
 
 interface AsrResponse {
   code: number;
@@ -10,9 +10,8 @@ interface AsrResponse {
 }
 
 export class MockSession {
-  private chunkCount = 0;
+  private sentenceChunkCount = 0;
   private phraseIndex = 0;
-  private partialText = '';
   private active = false;
 
   constructor(private readonly socket: WebSocket) {}
@@ -23,13 +22,17 @@ export class MockSession {
       return;
     }
     this.active = true;
-    this.chunkCount += 1;
-    if (this.chunkCount % CHUNKS_PER_PARTIAL !== 0) {
+    this.sentenceChunkCount += 1;
+    const sentence = PHRASES[this.phraseIndex % PHRASES.length];
+
+    if (this.sentenceChunkCount < CHUNKS_PER_SENTENCE) {
+      this.send(0, 'success', this.getPartialText(sentence), false);
       return;
     }
-    this.partialText += PHRASES[this.phraseIndex % PHRASES.length];
+
+    this.send(0, 'success', sentence, true);
+    this.sentenceChunkCount = 0;
     this.phraseIndex += 1;
-    this.send(0, 'success', this.partialText, false);
   }
 
   onControl(value: string): void {
@@ -49,16 +52,24 @@ export class MockSession {
       return;
     }
 
-    const text = this.partialText || PHRASES[0];
+    const text =
+      this.sentenceChunkCount > 0 ? PHRASES[this.phraseIndex % PHRASES.length] : '';
     this.send(0, 'success', text, true);
     this.reset();
   }
 
   private reset(): void {
-    this.chunkCount = 0;
+    this.sentenceChunkCount = 0;
     this.phraseIndex = 0;
-    this.partialText = '';
     this.active = false;
+  }
+
+  private getPartialText(sentence: string): string {
+    const characters = Array.from(sentence);
+    const length = Math.ceil(
+      (characters.length * this.sentenceChunkCount) / CHUNKS_PER_SENTENCE,
+    );
+    return characters.slice(0, length).join('');
   }
 
   private send(code: number, msg: string, text = '', isFinal = false): void {

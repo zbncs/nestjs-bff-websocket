@@ -19,8 +19,9 @@ ws://{host}:{port}/intelligentVoice/asr/stream
 
 - WebSocket 为长连接，同一条连接可承载多个顺序执行的识别会话。
 - 收到第一段二进制音频时开始一个识别会话。
-- `{"action":"stop"}` 只结束当前识别会话；服务端返回 `isFinal: true` 的结果后保留 WebSocket 连接。
-- 最终结果返回后，客户端可继续发送下一段二进制音频以开始新的识别会话。
+- 每句话可返回多次 `isFinal: false` 的动态结果；识别出该句最终内容后自动返回 `isFinal: true`，随后继续识别下一句话。
+- `{"action":"stop"}` 结束当前识别会话；如果当前句尚未完成，服务端先返回该句的最终结果。如果没有未完成内容，则返回 `text` 为空的最终响应作为 Session 结束确认。
+- `stop` 的结束确认返回后，客户端可继续发送下一段二进制音频以开始新的识别会话。
 - 用户离开页面、服务异常或连接连续 60 秒无数据时关闭 WebSocket。
 
 ### 1.2 连接 URL 查询参数
@@ -91,7 +92,7 @@ ws://localhost:8080/intelligentVoice/asr/stream?sampleRate=16000&language=zh-CN
 | 字段名 | 类型 | 说明 |
 | --- | --- | --- |
 | `text` | String | 识别出的文本内容 |
-| `isFinal` | boolean | 是否为当前句子的最终结果。`false` 表示中间结果（动态变化，需实时替换显示）；`true` 表示句子已结束（断句完成，需追加保存） |
+| `isFinal` | boolean | 是否为当前句子的最终结果。`false` 表示当前句的中间结果，需替换上一次动态内容；`true` 表示当前句已完成，需替换动态内容并转为已确认内容。`isFinal: true` 不代表 WebSocket 连接关闭 |
 
 #### 错误码
 

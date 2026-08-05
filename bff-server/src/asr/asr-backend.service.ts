@@ -87,7 +87,10 @@ export class AsrBackendService {
         socket.close(1002, 'invalid ASR response');
         return;
       }
-      if (response.data.isFinal || response.code !== 0) {
+      if (
+        response.code !== 0 ||
+        (response.data.isFinal && connection.recognitionState === 'stopping')
+      ) {
         connection.recognitionState = 'idle';
       }
       this.sendToBrowser(connection, response);

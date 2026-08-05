@@ -1,9 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useAsrStore } from '../store/asrStore';
 
-/**
- * 转写结果区：final 实色列表 + 当前 partial 灰色斜体行，自动滚动到底部。
- */
+/** 已确认文本与当前动态文本在同一连续内容区域中展示。 */
 export function TranscriptView(): JSX.Element {
   const finals = useAsrStore((s) => s.finals);
   const partialText = useAsrStore((s) => s.partialText);
@@ -16,16 +14,16 @@ export function TranscriptView(): JSX.Element {
   return (
     <div className="transcript-view">
       {finals.length === 0 && !partialText && (
-        <p className="transcript-view__empty">点击按钮开始录音，识别结果将实时显示在这里。</p>
+        <p className="transcript-view__empty">
+          点击按钮开始录音，识别结果将实时显示在这里。
+        </p>
       )}
-      <ul className="transcript-view__list">
-        {finals.map((text, index) => (
-          <li key={`final-${index}`} className="transcript-view__final">
-            {text}
-          </li>
-        ))}
-      </ul>
-      {partialText && <p className="transcript-view__partial">{partialText}</p>}
+      {(finals.length > 0 || partialText) && (
+        <p className="transcript-view__content">
+          <span className="transcript-view__final">{finals.join('')}</span>
+          {partialText && <span className="transcript-view__partial">{partialText}</span>}
+        </p>
+      )}
       <div ref={bottomRef} />
     </div>
   );

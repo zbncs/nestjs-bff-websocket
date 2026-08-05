@@ -115,8 +115,17 @@ export const useAsrStore = create<AsrStore>((set, get) => ({
       return;
     }
     if (response.data.isFinal) {
+      const currentState = get().state;
+      if (currentState !== 'recording' && currentState !== 'stopping') {
+        return;
+      }
       const finals = response.data.text ? [...get().finals, response.data.text] : get().finals;
-      set({ state: 'idle', finals, partialText: '', error: null });
+      set({
+        state: currentState === 'stopping' ? 'idle' : 'recording',
+        finals,
+        partialText: '',
+        error: null,
+      });
       return;
     }
     if (get().state === 'recording' || get().state === 'stopping') {

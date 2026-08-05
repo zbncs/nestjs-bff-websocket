@@ -5,14 +5,21 @@ sequenceDiagram
 
     Browser->>BFF: Connect /intelligentVoice/asr/stream?sampleRate&language
     BFF-->>Browser: WebSocket connected
-    Browser->>BFF: Binary PCM chunks
+    Browser->>BFF: PCM chunk 1
     BFF->>ASR: Establish or reuse managed connection
-    BFF->>ASR: Binary PCM chunks
-    ASR-->>BFF: {code:0,data:{text,isFinal:false}}
-    BFF-->>Browser: Normalized JSON response
+    BFF->>ASR: PCM chunk 1
+    ASR-->>BFF: {text:partial-1,isFinal:false}
+    BFF-->>Browser: Replace current dynamic text
+    Browser->>BFF: PCM chunk 2
+    BFF->>ASR: PCM chunk 2
+    ASR-->>BFF: {text:partial-2,isFinal:false}
+    BFF-->>Browser: Replace current dynamic text
+    Browser->>BFF: PCM chunk 3
+    BFF->>ASR: PCM chunk 3
+    ASR-->>BFF: {text:sentence-1,isFinal:true}
+    BFF-->>Browser: Replace dynamic text with confirmed text
+    Note over Browser,ASR: Recognition Session remains active for the next sentence
     Browser->>BFF: {"action":"stop"}
     BFF->>ASR: {"action":"stop"}
-    ASR-->>BFF: {code:0,data:{text,isFinal:true}}
-    BFF-->>Browser: Final JSON response
-    Note over Browser,BFF: WebSocket remains open
-    Browser->>BFF: Binary PCM chunks for next Session
+    ASR-->>BFF: Final unfinished sentence or empty final acknowledgement
+    BFF-->>Browser: Session ended; WebSocket remains open

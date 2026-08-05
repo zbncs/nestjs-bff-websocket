@@ -39,6 +39,7 @@ pnpm run --workspace web-h5 build
 - 音频消息：PCM、16-bit、小端序、单声道二进制数据，前端发送 3200 字节分片。
 - 停止消息：JSON 文本 `{"action":"stop"}`。
 - 响应消息：JSON 文本 `{code,msg,data:{text,isFinal}}`。
+- 每句话识别完成时自动返回 `isFinal=true`，然后在同一 Session 中继续识别下一句话。
 - `stop` 结束当前识别 Session，但不关闭 WebSocket；下一段音频开始新 Session。
 - 连续 60 秒无数据、页面离开或服务异常时关闭连接。
 
