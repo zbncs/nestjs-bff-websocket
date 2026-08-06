@@ -53,7 +53,9 @@ export class SocketService {
         }
         const response = parseAsrResponse(event.data);
         if (!response) {
-          this.handlers?.onProtocolError('服务端返回的 JSON 结构不符合接口文档');
+          this.handlers?.onProtocolError(
+            '服务端返回的 JSON 结构不符合接口文档'
+          );
           return;
         }
         this.handlers?.onResponse(response);

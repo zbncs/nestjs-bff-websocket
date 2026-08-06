@@ -1,4 +1,5 @@
-import { AsrUiState, useAsrStore } from '../store/asrStore';
+import type { AsrError } from '../types/protocol';
+import type { AsrUiState } from '../hooks/useAsr';
 
 const STATE_LABELS: Record<AsrUiState, string> = {
   idle: '空闲',
@@ -11,10 +12,7 @@ const STATE_LABELS: Record<AsrUiState, string> = {
 /**
  * 状态条：连接状态徽标 + 错误提示条带（含错误码与重试按钮）。
  */
-export function StatusBar(): JSX.Element {
-  const state = useAsrStore((s) => s.state);
-  const error = useAsrStore((s) => s.error);
-  const start = useAsrStore((s) => s.start);
+export function StatusBar({ state, error, start }: { state: AsrUiState; error: AsrError | null; start: () => Promise<void> }): JSX.Element {
 
   return (
     <div className="status-bar">

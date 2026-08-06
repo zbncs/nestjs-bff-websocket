@@ -154,6 +154,60 @@ body {
   padding: 40px 0;
 }
 
+.transcript-view__recording {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  color: #b42318;
+  font-size: 15px;
+}
+
+.transcript-view__recording-dot {
+  width: 9px;
+  height: 9px;
+  margin-right: 8px;
+  border-radius: 50%;
+  background: #d92d20;
+  animation: recording-pulse 1.2s ease-in-out infinite;
+}
+
+.transcript-view__recording-text {
+  animation: recording-text-blink 1.2s ease-in-out infinite;
+}
+
+.transcript-view__dots {
+  display: inline-flex;
+  width: 18px;
+}
+
+.transcript-view__dots span {
+  animation: recording-dot 1.2s ease-in-out infinite;
+}
+
+.transcript-view__dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.transcript-view__dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes recording-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes recording-dot {
+  0%, 60%, 100% { opacity: 0.25; }
+  30% { opacity: 1; }
+}
+
+@keyframes recording-text-blink {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
 .transcript-view__content {
   padding: 10px 12px;
   font-size: 15px;
@@ -164,11 +218,6 @@ body {
 
 .transcript-view__final {
   color: #1f2329;
-}
-
-.transcript-view__partial {
-  color: #9aa0a6;
-  font-style: italic;
 }
 
 /* ===== 录音按钮 ===== */

@@ -1,30 +1,30 @@
-import { useEffect, useRef } from 'react';
-import { useAsrStore } from '../store/asrStore';
+import type { AsrUiState } from '../hooks/useAsr';
 
-/** 已确认文本与当前动态文本在同一连续内容区域中展示。 */
-export function TranscriptView(): JSX.Element {
-  const finals = useAsrStore((s) => s.finals);
-  const partialText = useAsrStore((s) => s.partialText);
-  const bottomRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [finals, partialText]);
+/** 录音期间显示状态动画，停止后只展示完整识别结果。 */
+export function TranscriptView({ state, text }: { state: AsrUiState; text: string }): JSX.Element {
+  const isRecording = state === 'connecting' || state === 'recording';
 
   return (
     <div className="transcript-view">
-      {finals.length === 0 && !partialText && (
+      {isRecording && (
+        <p className="transcript-view__recording" role="status">
+          <span className="transcript-view__recording-dot" aria-hidden="true" />
+          <span className="transcript-view__recording-text">正在录制中</span>
+          <span className="transcript-view__dots" aria-hidden="true">
+            <span>.</span><span>.</span><span>.</span>
+          </span>
+        </p>
+      )}
+      {!isRecording && state !== 'stopping' && !text && (
         <p className="transcript-view__empty">
-          点击按钮开始录音，识别结果将实时显示在这里。
+          点击按钮开始录音，完整识别结果将在录音结束后显示。
         </p>
       )}
-      {(finals.length > 0 || partialText) && (
+      {!isRecording && text && (
         <p className="transcript-view__content">
-          <span className="transcript-view__final">{finals.join('')}</span>
-          {partialText && <span className="transcript-view__partial">{partialText}</span>}
+          <span className="transcript-view__final">{text}</span>
         </p>
       )}
-      <div ref={bottomRef} />
     </div>
   );
 }

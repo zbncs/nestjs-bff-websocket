@@ -10,23 +10,40 @@ export class AudioRecorderService {
   private processor: ScriptProcessorNode | null = null;
   private silentGain: GainNode | null = null;
 
-  async start(sampleRate: number, onChunk: (chunk: ArrayBuffer) => void): Promise<void> {
+  async start(
+    sampleRate: number,
+    onChunk: (chunk: ArrayBuffer) => void
+  ): Promise<void> {
     this.stop();
     if (!navigator.mediaDevices?.getUserMedia) {
-      throw this.error(ClientErrorCode.MicNotFound, '当前浏览器不支持麦克风采集');
+      throw this.error(
+        ClientErrorCode.MicNotFound,
+        '当前浏览器不支持麦克风采集'
+      );
     }
 
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, sampleRate, echoCancellation: false, noiseSuppression: false },
+        audio: {
+          channelCount: 1,
+          sampleRate,
+          echoCancellation: false,
+          noiseSuppression: false,
+        },
       });
     } catch (err) {
       const name = err instanceof DOMException ? err.name : '';
       if (name === 'NotFoundError' || name === 'OverconstrainedError') {
-        throw this.error(ClientErrorCode.MicNotFound, '未检测到可用的麦克风设备');
+        throw this.error(
+          ClientErrorCode.MicNotFound,
+          '未检测到可用的麦克风设备'
+        );
       }
-      throw this.error(ClientErrorCode.MicDenied, '麦克风权限被拒绝，请在浏览器设置中授权');
+      throw this.error(
+        ClientErrorCode.MicDenied,
+        '麦克风权限被拒绝，请在浏览器设置中授权'
+      );
     }
 
     const context = new AudioContext({ sampleRate });
@@ -34,7 +51,11 @@ export class AudioRecorderService {
     const processor = context.createScriptProcessor(2_048, 1, 1);
     const silentGain = context.createGain();
     silentGain.gain.value = 0;
-    const encoder = new PcmChunkEncoder(context.sampleRate, sampleRate, AUDIO_CHUNK_BYTES / 2);
+    const encoder = new PcmChunkEncoder(
+      context.sampleRate,
+      sampleRate,
+      AUDIO_CHUNK_BYTES / 2
+    );
 
     processor.onaudioprocess = (event: AudioProcessingEvent) => {
       const input = event.inputBuffer.getChannelData(0);
@@ -89,7 +110,7 @@ class PcmChunkEncoder {
   constructor(
     private readonly inputSampleRate: number,
     private readonly outputSampleRate: number,
-    private readonly chunkSamples: number,
+    private readonly chunkSamples: number
   ) {}
 
   push(input: Float32Array): ArrayBuffer[] {
@@ -103,7 +124,11 @@ class PcmChunkEncoder {
       const end = Math.max(start + 1, Math.floor(this.inputPosition + ratio));
       let total = 0;
       let count = 0;
-      for (let index = start; index < end && index < this.inputSamples.length; index += 1) {
+      for (
+        let index = start;
+        index < end && index < this.inputSamples.length;
+        index += 1
+      ) {
         total += this.inputSamples[index];
         count += 1;
       }
