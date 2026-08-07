@@ -1,13 +1,14 @@
 import type { IncomingMessage } from 'node:http';
-import type { Duplex } from 'node:stream';
+import { Logger, type OnApplicationShutdown } from '@nestjs/common';
 import {
-  Injectable,
-  Logger,
-  type OnApplicationBootstrap,
-  type OnApplicationShutdown,
-} from '@nestjs/common';
-import { HttpAdapterHost } from '@nestjs/core';
-import WebSocket, { type RawData, WebSocketServer } from 'ws';
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  SubscribeMessage,
+  WebSocketGateway,
+} from '@nestjs/websockets';
+import WebSocket, { type RawData } from 'ws';
 import { WEBSOCKET_IDLE_TIMEOUT_MS } from '../config';
 import {
   ASR_STREAM_PATH,
@@ -18,47 +19,28 @@ import {
   createResponse,
   parseControlMessage,
 } from '../protocol/events';
+import { ASR_MESSAGE_EVENT } from '../protocol/native-ws.adapter';
 import { AsrBackendService } from './asr-backend.service';
 import { type ClientConnection, SessionManager } from './session.manager';
 
-@Injectable()
-export class AsrGateway implements OnApplicationBootstrap, OnApplicationShutdown {
+@WebSocketGateway({ path: ASR_STREAM_PATH })
+export class AsrGateway
+  implements OnGatewayConnection, OnGatewayDisconnect, OnApplicationShutdown
+{
   private readonly logger = new Logger(AsrGateway.name);
-  private readonly server = new WebSocketServer({ noServer: true });
-  private httpServer: ReturnType<HttpAdapterHost['httpAdapter']['getHttpServer']> | null = null;
 
   constructor(
-    private readonly httpAdapterHost: HttpAdapterHost,
     private readonly backendService: AsrBackendService,
     private readonly sessionManager: SessionManager,
   ) {}
 
-  onApplicationBootstrap(): void {
-    this.httpServer = this.httpAdapterHost.httpAdapter.getHttpServer();
-    this.httpServer.on('upgrade', this.handleUpgrade);
-    this.server.on('connection', this.handleConnection);
-  }
-
   onApplicationShutdown(): void {
-    this.httpServer?.off('upgrade', this.handleUpgrade);
     for (const connection of this.sessionManager.all()) {
       this.closeConnection(connection);
     }
-    this.server.close();
   }
 
-  private readonly handleUpgrade = (request: IncomingMessage, socket: Duplex, head: Buffer): void => {
-    const url = new URL(request.url ?? '/', 'http://localhost');
-    if (url.pathname !== ASR_STREAM_PATH) {
-      socket.destroy();
-      return;
-    }
-    this.server.handleUpgrade(request, socket, head, (webSocket) => {
-      this.server.emit('connection', webSocket, request);
-    });
-  };
-
-  private readonly handleConnection = (clientSocket: WebSocket, request: IncomingMessage): void => {
+  handleConnection(clientSocket: WebSocket, request: IncomingMessage): void {
     const requestUrl = new URL(request.url ?? ASR_STREAM_PATH, 'http://localhost');
     const options = this.parseOptions(requestUrl.searchParams);
     if (!options) {
@@ -71,28 +53,42 @@ export class AsrGateway implements OnApplicationBootstrap, OnApplicationShutdown
     this.refreshIdleTimer(connection);
     this.logger.log(`browser connected: ${connection.id}`);
 
-    clientSocket.on('message', (data: RawData, isBinary: boolean) => {
-      this.refreshIdleTimer(connection);
-      this.handleMessage(connection, rawDataToBuffer(data), isBinary);
-    });
-    clientSocket.on('close', () => this.closeConnection(connection));
     clientSocket.on('error', (error: Error) => {
       this.logger.warn(`browser connection error ${connection.id}: ${error.message}`);
     });
-  };
+  }
 
-  private handleMessage(connection: ClientConnection, data: Buffer, isBinary: boolean): void {
+  handleDisconnect(clientSocket: WebSocket): void {
+    const connection = this.sessionManager.get(clientSocket);
+    if (connection) {
+      this.closeConnection(connection);
+    }
+  }
+
+  @SubscribeMessage(ASR_MESSAGE_EVENT)
+  handleMessage(
+    @ConnectedSocket() clientSocket: WebSocket,
+    @MessageBody() data: string | RawData,
+  ): void {
+    const connection = this.sessionManager.get(clientSocket);
+    if (!connection) {
+      return;
+    }
+    this.refreshIdleTimer(connection);
+
+    const isBinary = typeof data !== 'string';
+    const buffer = rawDataToBuffer(data);
     if (isBinary) {
       if (connection.recognitionState === 'stopping') {
         this.sendError(connection, AsrErrorCode.InvalidState, 'The current recognition session is stopping');
         return;
       }
       connection.recognitionState = 'recognizing';
-      this.backendService.forward(connection, data, true);
+      this.backendService.forward(connection, buffer, true);
       return;
     }
 
-    const control = parseControlMessage(data.toString('utf8'));
+    const control = parseControlMessage(buffer.toString('utf8'));
     if (!control) {
       this.sendError(connection, AsrErrorCode.InvalidMessage, 'Only the {"action":"stop"} control message is supported');
       return;
@@ -145,9 +141,15 @@ export class AsrGateway implements OnApplicationBootstrap, OnApplicationShutdown
   }
 }
 
-function rawDataToBuffer(data: RawData): Buffer {
+function rawDataToBuffer(data: string | RawData): Buffer {
+  if (typeof data === 'string') {
+    return Buffer.from(data);
+  }
   if (Array.isArray(data)) {
     return Buffer.concat(data);
   }
-  return Buffer.isBuffer(data) ? data : Buffer.from(data);
+  if (Buffer.isBuffer(data)) {
+    return data;
+  }
+  return Buffer.from(data);
 }
